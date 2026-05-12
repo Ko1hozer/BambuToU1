@@ -1,6 +1,6 @@
 # Bambu Lab to Snapmaker U1 Converter
 
-A web-based tool to convert Bambu Lab .3mf projects to Snapmaker U1 format, preserving multi-color painting and filament assignments.
+A web-based tool and Telegram bot for converting Bambu Lab .3mf projects to Snapmaker U1 format, with print cost calculation.
 
 **Live version:** [https://bl2u1.nbn.cat](https://bl2u1.nbn.cat)
 
@@ -16,6 +16,33 @@ A web-based tool to convert Bambu Lab .3mf projects to Snapmaker U1 format, pres
 - Downloaded file keeps the original name (e.g. `my_model-U1.3mf`)
 - Simple drag & drop interface
 - No installation required (web-based)
+- **NEW: Telegram Bot** - Convert files directly in Telegram
+- **NEW: Print Cost Calculator** - Automatic cost estimation based on material, weight, and time
+- **NEW: Mini App** - Full-featured web interface inside Telegram
+
+## Telegram Bot
+
+The project now includes a Telegram bot that provides:
+
+### Features
+
+📤 **File Conversion**: Upload and convert .3mf files directly in Telegram
+💰 **Cost Calculation**: Automatic print cost estimation based on:
+   - Material weight
+   - Filament type (PLA, PETG, ABS, TPU)
+   - Print time
+   - Support structures
+📱 **Mini App**: Full web interface inside Telegram
+🔧 **Filament Configuration**: Select and configure colors and material types
+
+### Quick Start
+
+1. Get a bot token from [@BotFather](https://t.me/BotFather)
+2. Copy `.env.example` to `.env` and add your token
+3. Install dependencies: `pip install -r requirements.txt`
+4. Run: `cd telegram_bot && python bot.py`
+
+See [telegram_bot/README.md](telegram_bot/README.md) for detailed instructions.
 
 ## How It Works
 
@@ -28,8 +55,10 @@ A web-based tool to convert Bambu Lab .3mf projects to Snapmaker U1 format, pres
 
 ### Requirements
 
-- Python 3.8+
-- Flask
+- Python 3.9+
+- Flask (for web app)
+- aiogram 3.x (for Telegram bot)
+- aiohttp 3.9+ (for Mini App server)
 
 ### Installation
 
@@ -39,25 +68,33 @@ git clone https://github.com/josuanbn/bl2u1.git
 cd bl2u1
 
 # Install dependencies
-pip install flask
+pip install -r requirements.txt
 
-# Run the application
+# Run the web application
 python app.py
+
+# Or run the Telegram bot + Mini App
+cd telegram_bot
+python bot.py
 ```
 
-The application will be available at `http://localhost:8080`
+The web application will be available at `http://localhost:8080`
 
 ### Project Structure
 
 ```
 bl2u1/
-├── app.py                    # Flask backend
+├── app.py                    # Flask backend (web app)
 ├── templates/
 │   └── index.html            # Frontend interface
 ├── uploads/                  # Temporary file storage (auto-cleaned)
 ├── u1_template.3mf           # U1 template without supports
 ├── u1_template_supports.3mf  # U1 template with tree supports
-└── filament_types.3mf        # Available filament profiles
+├── filament_types.3mf        # Available filament profiles
+└── telegram_bot/             # Telegram bot + Mini App
+    ├── bot.py                # Bot and Mini App server
+    ├── README.md             # Bot documentation
+    └── .env.example          # Environment variables template
 ```
 
 ### Template Files
@@ -77,10 +114,30 @@ The converter performs the following transformations:
 3. **Color Preservation**: Maintains all color painting data from the original file
 4. **Support Detection**: Checks `different_settings_to_system` for `enable_support` and uses the appropriate template
 5. **Filament Padding**: Ensures 4 filaments are always configured (fills empty slots with white PLA)
+6. **Cost Calculation**: Estimates print cost based on material type, weight, and print time
 
 ### File Cleanup
 
 Uploaded files are automatically deleted after 8 hours to save disk space.
+
+## Pricing Configuration
+
+The cost calculator uses the following default pricing (configurable in `telegram_bot/bot.py`):
+
+```python
+PRICING_CONFIG = {
+    "base_price": 5.0,        # Base setup fee ($)
+    "price_per_gram": 0.05,   # Price per gram of filament
+    "price_per_hour": 2.0,    # Price per hour of printing
+    "support_multiplier": 1.2,# Multiplier if supports are needed
+    "material_prices": {
+        "PLA": 0.03,
+        "PETG": 0.04,
+        "ABS": 0.05,
+        "TPU": 0.06,
+    }
+}
+```
 
 ## Limitations
 

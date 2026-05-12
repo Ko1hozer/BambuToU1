@@ -1,4 +1,23 @@
+```
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
 
-uploads/
+# Environment
+.env
+.env.local
+.env.*
 
-.claude/
+# Dependencies
+venv/
+.venv/
+
+# Logs
+*.log
+
+# Temporary files
+*.tmp
+*.swp
+```
