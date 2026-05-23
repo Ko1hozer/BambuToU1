@@ -1,6 +1,7 @@
 """
 Telegram Bot for 3MF Converter and Print Cost Calculator
-Supports: file conversion, cost calculation, mini-app integration
+Supports: file conversion, cost calculation, mini-app integration,
+user profiles, printer selection, energy tariffs, and presets
 """
 
 import os
@@ -24,6 +25,8 @@ from aiogram.types import (
 from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
 from aiohttp import web as aiohttp_web
 
+from database import db, PrinterProfile, EnergyTariff, CostPreset
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -38,8 +41,8 @@ API_PORT = int(os.getenv("API_PORT", "8080"))
 UPLOAD_FOLDER = Path("uploads")
 UPLOAD_FOLDER.mkdir(exist_ok=True)
 
-# Pricing configuration (can be customized)
-PRICING_CONFIG = {
+# Default pricing configuration (used when no preset is selected)
+DEFAULT_PRICING_CONFIG = {
     "base_price": 5.0,  # Base setup fee in USD
     "price_per_gram": 0.05,  # Price per gram of filament
     "price_per_hour": 2.0,  # Price per hour of printing
@@ -179,46 +182,119 @@ def parse_3mf_filaments(filepath: Path) -> list[FilamentInfo]:
     return filaments
 
 
+def get_pricing_config(user_id: str) -> Dict[str, Any]:
+    """Get pricing configuration for user (from preset or default)"""
+    user = db.get_user(user_id)
+    if user and user.default_preset_id:
+        preset = db.get_preset(user.default_preset_id)
+        if preset:
+            return {
+                "base_price": preset.base_price,
+                "price_per_gram": preset.price_per_gram,
+                "price_per_hour": preset.price_per_hour,
+                "support_multiplier": preset.support_multiplier,
+                "material_prices": preset.material_prices,
+                "energy_enabled": preset.energy_enabled,
+                "tariff_id": preset.tariff_id,
+            }
+    return DEFAULT_PRICING_CONFIG.copy()
+
+
+def calculate_energy_cost(print_time_hours: float, printer_id: Optional[str], 
+                         tariff_id: Optional[str]) -> Dict[str, Any]:
+    """Calculate energy cost based on printer consumption and tariff"""
+    if not printer_id or not tariff_id:
+        return {"energy_kwh": 0, "energy_cost": 0, "currency": "USD"}
+    
+    printer = db.get_printer(printer_id)
+    tariff = db.get_tariff(tariff_id)
+    
+    if not printer or not tariff:
+        return {"energy_kwh": 0, "energy_cost": 0, "currency": tariff.currency if tariff else "USD"}
+    
+    # Calculate energy consumption
+    energy_kwh = printer.power_consumption * print_time_hours
+    
+    # Apply peak hours if configured
+    multiplier = 1.0
+    if tariff.peak_hours_start != tariff.peak_hours_end and tariff.peak_multiplier > 1.0:
+        # Simplified: assume printing during peak hours
+        multiplier = tariff.peak_multiplier
+    
+    energy_cost = energy_kwh * tariff.price_per_kwh * multiplier
+    
+    return {
+        "energy_kwh": round(energy_kwh, 2),
+        "energy_cost": round(energy_cost, 2),
+        "currency": tariff.currency,
+        "printer_name": printer.name,
+        "tariff_name": tariff.name,
+    }
+
+
 def calculate_print_cost(
     filaments: list[FilamentInfo],
     has_supports: bool = False,
-    print_time_hours: float = 0.0
+    print_time_hours: float = 0.0,
+    user_id: Optional[str] = None,
+    printer_id: Optional[str] = None,
+    tariff_id: Optional[str] = None
 ) -> Dict[str, Any]:
-    """Calculate estimated print cost"""
+    """Calculate estimated print cost with optional energy cost"""
+    # Get pricing config for user
+    pricing = get_pricing_config(user_id) if user_id else DEFAULT_PRICING_CONFIG
+    
     total_weight = sum(f.used_g for f in filaments)
     
     # Calculate material cost based on type
     material_cost = 0.0
     for f in filaments:
-        price_per_gram = PRICING_CONFIG["material_prices"].get(
+        price_per_gram = pricing["material_prices"].get(
             f.type, 
-            PRICING_CONFIG["material_prices"]["DEFAULT"]
+            pricing["material_prices"].get("DEFAULT", 0.04)
         )
         material_cost += f.used_g * price_per_gram
     
     # If no weight info, estimate from count
     if total_weight == 0:
         total_weight = len(filaments) * 50  # Assume 50g per filament as fallback
-        material_cost = total_weight * PRICING_CONFIG["price_per_gram"]
+        material_cost = total_weight * pricing.get("price_per_gram", 0.05)
     
     # Time-based cost
-    time_cost = print_time_hours * PRICING_CONFIG["price_per_hour"]
+    time_cost = print_time_hours * pricing.get("price_per_hour", 2.0)
     
     # Support multiplier
-    total = PRICING_CONFIG["base_price"] + material_cost + time_cost
+    subtotal = pricing.get("base_price", 5.0) + material_cost + time_cost
     if has_supports:
-        total *= PRICING_CONFIG["support_multiplier"]
+        subtotal *= pricing.get("support_multiplier", 1.2)
     
-    return {
-        "base_price": PRICING_CONFIG["base_price"],
+    # Energy cost (if enabled)
+    energy_data = {"energy_kwh": 0, "energy_cost": 0, "currency": "USD"}
+    if pricing.get("energy_enabled", False):
+        energy_tariff = tariff_id or pricing.get("tariff_id")
+        energy_data = calculate_energy_cost(print_time_hours, printer_id, energy_tariff)
+    
+    total = subtotal + energy_data["energy_cost"]
+    
+    result = {
+        "base_price": pricing.get("base_price", 5.0),
         "material_cost": round(material_cost, 2),
         "time_cost": round(time_cost, 2),
         "total_weight_g": round(total_weight, 1),
         "print_time_hours": print_time_hours,
         "has_supports": has_supports,
+        "energy_kwh": energy_data.get("energy_kwh", 0),
+        "energy_cost": energy_data.get("energy_cost", 0),
         "total": round(total, 2),
-        "currency": "USD",
+        "currency": energy_data.get("currency", "USD"),
     }
+    
+    if energy_data.get("printer_name"):
+        result["printer_name"] = energy_data["printer_name"]
+    if energy_data.get("tariff_name"):
+        result["tariff_name"] = energy_data["tariff_name"]
+    
+    return result
 
 
 def _safe_path(filename: str) -> Optional[Path]:
@@ -463,6 +539,8 @@ def get_main_keyboard() -> ReplyKeyboardMarkup:
     builder = ReplyKeyboardBuilder()
     builder.button(text="📤 Конвертировать файл", command="convert")
     builder.button(text="💰 Калькулятор стоимости", command="calc")
+    builder.button(text="⚙️ Настройки", command="settings")
+    builder.button(text="👤 Личный кабинет", command="profile")
     builder.button(text="📱 Mini App", web_app=WebAppInfo(url=WEB_APP_URL))
     builder.button(text="ℹ️ Помощь", command="help")
     builder.adjust(2, 2)
@@ -563,6 +641,324 @@ if bot and dp:
             "/calc_time 5.5 - добавить время печати (5.5 часов)",
             parse_mode="HTML"
         )
+
+
+    @dp.message(Command("settings"))
+    async def cmd_settings(message: types.Message):
+        """Handle /settings command - printer and tariff selection"""
+        user_id = str(message.from_user.id)
+        
+        # Create or update user profile
+        user = db.create_or_update_user(
+            user_id=user_id,
+            username=message.from_user.username,
+            first_name=message.from_user.first_name,
+            last_name=message.from_user.last_name,
+            language_code=message.from_user.language_code
+        )
+        
+        # Get all printers grouped by manufacturer
+        printers = db.get_all_printers()
+        manufacturers = {}
+        for p in printers:
+            if p.manufacturer not in manufacturers:
+                manufacturers[p.manufacturer] = []
+            manufacturers[p.manufacturer].append(p)
+        
+        # Build keyboard with manufacturers
+        builder = InlineKeyboardBuilder()
+        
+        for manufacturer in sorted(manufacturers.keys()):
+            builder.button(
+                text=f"🖨️ {manufacturer}",
+                callback_data=f"manuf_{manufacturer}"
+            )
+        
+        # Show current printer
+        current_printer = ""
+        if user.printer_id:
+            printer = db.get_printer(user.printer_id)
+            if printer:
+                current_printer = f"\n\n✅ Текущий принтер: <b>{printer.name}</b>"
+        
+        builder.button(text="⚡ Тарифы на энергию", callback_data="tariffs_menu")
+        builder.button(text="💾 Пресеты калькулятора", callback_data="presets_menu")
+        builder.adjust(1)
+        
+        await message.answer(
+            f"⚙️ <b>Настройки</b>{current_printer}\n\n"
+            f"Выберите производителя вашего принтера:",
+            reply_markup=builder.as_markup(),
+            parse_mode="HTML"
+        )
+
+
+    @dp.message(Command("profile"))
+    async def cmd_profile(message: types.Message):
+        """Handle /profile command - show user profile"""
+        user_id = str(message.from_user.id)
+        
+        user = db.get_user(user_id)
+        if not user:
+            user = db.create_or_update_user(
+                user_id=user_id,
+                username=message.from_user.username,
+                first_name=message.from_user.first_name,
+                last_name=message.from_user.last_name
+            )
+        
+        # Get current printer info
+        printer_info = "Не выбран"
+        if user.printer_id:
+            printer = db.get_printer(user.printer_id)
+            if printer:
+                printer_info = (
+                    f"<b>{printer.name}</b>\n"
+                    f"• Объем: {printer.build_volume_x}×{printer.build_volume_y}×{printer.build_volume_z} мм\n"
+                    f"• Потребление: {printer.power_consumption} кВт/ч\n"
+                    f"• Сопло: {printer.nozzle_diameter} мм"
+                )
+        
+        # Get current tariff info
+        tariff_info = "Не выбран"
+        if user.tariff_id:
+            tariff = db.get_tariff(user.tariff_id)
+            if tariff:
+                tariff_info = (
+                    f"<b>{tariff.name}</b>\n"
+                    f"• Цена: {tariff.price_per_kwh} {tariff.currency}/кВт·ч"
+                )
+        
+        # Get default preset info
+        preset_info = "Не выбран"
+        if user.default_preset_id:
+            preset = db.get_preset(user.default_preset_id)
+            if preset:
+                preset_info = f"<b>{preset.name}</b>"
+        
+        # Build profile keyboard
+        builder = InlineKeyboardBuilder()
+        builder.button(text="⚙️ Изменить настройки", callback_data="settings_from_profile")
+        builder.button(text="💾 Мои пресеты", callback_data="my_presets")
+        builder.adjust(1)
+        
+        await message.answer(
+            f"👤 <b>Личный кабинет</b>\n\n"
+            f"📛 Имя: {user.first_name or 'N/A'}\n"
+            f"🔗 Username: @{user.username or 'N/A'}\n\n"
+            f"🖨️ <b>Принтер:</b>\n{printer_info}\n\n"
+            f"⚡ <b>Тариф:</b>\n{tariff_info}\n\n"
+            f"💾 <b>Пресет по умолчанию:</b>\n{preset_info}\n\n"
+            f"📅 Регистрация: {user.created_at[:10]}",
+            reply_markup=builder.as_markup(),
+            parse_mode="HTML"
+        )
+
+
+    @dp.callback_query(F.data.startswith("manuf_"))
+    async def handle_manufacturer_select(callback: types.CallbackQuery):
+        """Handle manufacturer selection"""
+        user_id = str(callback.from_user.id)
+        manufacturer = callback.data.replace("manuf_", "")
+        
+        printers = db.get_printers_by_manufacturer(manufacturer)
+        
+        builder = InlineKeyboardBuilder()
+        for printer in printers:
+            builder.button(
+                text=f"🖨️ {printer.name}",
+                callback_data=f"printer_{printer.id}"
+            )
+        builder.button(text="⬅️ Назад", callback_data="settings_back")
+        builder.adjust(1)
+        
+        await callback.message.edit_text(
+            f"🖨️ <b>{manufacturer}</b>\n\nВыберите вашу модель:",
+            reply_markup=builder.as_markup(),
+            parse_mode="HTML"
+        )
+
+
+    @dp.callback_query(F.data.startswith("printer_"))
+    async def handle_printer_select(callback: types.CallbackQuery):
+        """Handle printer selection"""
+        user_id = str(callback.from_user.id)
+        printer_id = callback.data.replace("printer_", "")
+        
+        printer = db.get_printer(printer_id)
+        if not printer:
+            await callback.answer("❌ Принтер не найден", show_alert=True)
+            return
+        
+        # Update user's printer
+        db.update_user_printer(user_id, printer_id)
+        
+        await callback.answer(f"✅ Выбран: {printer.name}", show_alert=False)
+        
+        # Update profile message
+        user = db.get_user(user_id)
+        builder = InlineKeyboardBuilder()
+        builder.button(text="⬅️ Назад к настройкам", callback_data="settings_back")
+        
+        await callback.message.edit_text(
+            f"✅ <b>Принтер настроен!</b>\n\n"
+            f"🖨️ <b>{printer.name}</b>\n"
+            f"• Производитель: {printer.manufacturer}\n"
+            f"• Объем печати: {printer.build_volume_x}×{printer.build_volume_y}×{printer.build_volume_z} мм\n"
+            f"• Потребление энергии: {printer.power_consumption} кВт/ч\n"
+            f"• Диаметр сопла: {printer.nozzle_diameter} мм\n"
+            f"• Макс. температура сопла: {printer.max_nozzle_temp}°C\n"
+            f"• Макс. температура стола: {printer.max_bed_temp}°C\n\n"
+            f"Поддерживаемые филаменты: {', '.join(printer.filament_types)}",
+            reply_markup=builder.as_markup(),
+            parse_mode="HTML"
+        )
+
+
+    @dp.callback_query(F.data == "tariffs_menu")
+    async def handle_tariffs_menu(callback: types.CallbackQuery):
+        """Show tariffs menu"""
+        tariffs = db.get_all_tariffs()
+        
+        builder = InlineKeyboardBuilder()
+        for tariff in tariffs:
+            builder.button(
+                text=f"⚡ {tariff.name} ({tariff.price_per_kwh} {tariff.currency})",
+                callback_data=f"tariff_{tariff.id}"
+            )
+        builder.button(text="➕ Добавить свой тариф", callback_data="add_custom_tariff")
+        builder.button(text="⬅️ Назад", callback_data="settings_back")
+        builder.adjust(1)
+        
+        await callback.message.edit_text(
+            "⚡ <b>Тарифы на электроэнергию</b>\n\n"
+            "Выберите ваш тариф для расчета энергозатрат:",
+            reply_markup=builder.as_markup(),
+            parse_mode="HTML"
+        )
+
+
+    @dp.callback_query(F.data.startswith("tariff_"))
+    async def handle_tariff_select(callback: types.CallbackQuery):
+        """Handle tariff selection"""
+        user_id = str(callback.from_user.id)
+        tariff_id = callback.data.replace("tariff_", "")
+        
+        tariff = db.get_tariff(tariff_id)
+        if not tariff:
+            await callback.answer("❌ Тариф не найден", show_alert=True)
+            return
+        
+        # Update user's tariff
+        db.update_user_tariff(user_id, tariff_id)
+        
+        await callback.answer(f"✅ Выбран тариф: {tariff.name}", show_alert=False)
+        
+        builder = InlineKeyboardBuilder()
+        builder.button(text="⬅️ Назад к тарифам", callback_data="tariffs_menu")
+        
+        peak_info = ""
+        if tariff.peak_hours_start != tariff.peak_hours_end:
+            peak_info = f"\n• Пиковые часы: {tariff.peak_hours_start}:00 - {tariff.peak_hours_end}:00 (x{tariff.peak_multiplier})"
+        
+        await callback.message.edit_text(
+            f"✅ <b>Тариф настроен!</b>\n\n"
+            f"⚡ <b>{tariff.name}</b>\n"
+            f"• Цена: {tariff.price_per_kwh} {tariff.currency}/кВт·ч{peak_info}",
+            reply_markup=builder.as_markup(),
+            parse_mode="HTML"
+        )
+
+
+    @dp.callback_query(F.data == "presets_menu")
+    async def handle_presets_menu(callback: types.CallbackQuery):
+        """Show presets menu"""
+        user_id = str(callback.from_user.id)
+        presets = db.get_user_presets(user_id)
+        
+        builder = InlineKeyboardBuilder()
+        for preset in presets:
+            default_mark = " ⭐" if preset.is_default else ""
+            builder.button(
+                text=f"💾 {preset.name}{default_mark}",
+                callback_data=f"preset_edit_{preset.id}"
+            )
+        builder.button(text="➕ Создать новый пресет", callback_data="preset_create")
+        builder.button(text="⬅️ Назад", callback_data="settings_back")
+        builder.adjust(1)
+        
+        preset_list = "\n".join([f"• {p.name}" for p in presets]) if presets else "Нет сохраненных пресетов"
+        
+        await callback.message.edit_text(
+            f"💾 <b>Пресеты калькулятора</b>\n\n"
+            f"Ваши пресеты:\n{preset_list}",
+            reply_markup=builder.as_markup(),
+            parse_mode="HTML"
+        )
+
+
+    @dp.callback_query(F.data == "settings_back")
+    async def handle_settings_back(callback: types.CallbackQuery):
+        """Go back to settings menu"""
+        user_id = str(callback.from_user.id)
+        user = db.get_user(user_id)
+        
+        builder = InlineKeyboardBuilder()
+        builder.button(text="🖨️ Выбрать принтер", callback_data="printers_list")
+        builder.button(text="⚡ Тарифы на энергию", callback_data="tariffs_menu")
+        builder.button(text="💾 Пресеты калькулятора", callback_data="presets_menu")
+        builder.adjust(1)
+        
+        current_printer = ""
+        if user and user.printer_id:
+            printer = db.get_printer(user.printer_id)
+            if printer:
+                current_printer = f"\n\n✅ Текущий принтер: <b>{printer.name}</b>"
+        
+        await callback.message.edit_text(
+            f"⚙️ <b>Настройки</b>{current_printer}\n\n"
+            f"Выберите раздел:",
+            reply_markup=builder.as_markup(),
+            parse_mode="HTML"
+        )
+
+
+    @dp.callback_query(F.data == "printers_list")
+    async def handle_printers_list(callback: types.CallbackQuery):
+        """Show all printers list"""
+        printers = db.get_all_printers()
+        manufacturers = {}
+        for p in printers:
+            if p.manufacturer not in manufacturers:
+                manufacturers[p.manufacturer] = []
+            manufacturers[p.manufacturer].append(p)
+        
+        builder = InlineKeyboardBuilder()
+        for manufacturer in sorted(manufacturers.keys()):
+            builder.button(
+                text=f"🖨️ {manufacturer}",
+                callback_data=f"manuf_{manufacturer}"
+            )
+        builder.button(text="⬅️ Назад", callback_data="settings_back")
+        builder.adjust(1)
+        
+        await callback.message.edit_text(
+            "🖨️ <b>Выберите производителя</b>",
+            reply_markup=builder.as_markup(),
+            parse_mode="HTML"
+        )
+
+
+    @dp.callback_query(F.data == "my_presets")
+    async def handle_my_presets(callback: types.CallbackQuery):
+        """Show user's presets from profile"""
+        await handle_presets_menu(callback)
+
+
+    @dp.callback_query(F.data == "settings_from_profile")
+    async def handle_settings_from_profile(callback: types.CallbackQuery):
+        """Go to settings from profile"""
+        await handle_settings_back(callback)
 
 
     @dp.message(F.document)
